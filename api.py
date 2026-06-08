@@ -353,8 +353,9 @@ def _download_image(url: str) -> str:
 def _run_generation(session: str, image_path: str,
                     prompt: str, aspect_ratio: str) -> list[str]:
     client   = ToolkitClient(session)
-    file_key, _, presigned_get, mime_type = client.upload_image(image_path)
-    quote    = client.get_cost_quote(presigned_get, prompt=prompt, aspect_ratio=aspect_ratio)
+    file_key, file_url, presigned_get, mime_type = client.upload_image(image_path)
+    quote    = client.get_cost_quote(presigned_get, file_url=file_url,
+                                     prompt=prompt, aspect_ratio=aspect_ratio)
 
     price = quote.get("cost") or quote.get("price") or 0
     if price > 0:
@@ -362,7 +363,7 @@ def _run_generation(session: str, image_path: str,
 
     chat_session_id = client.create_generation(
         prompt=prompt, file_key=file_key, presigned_get=presigned_get,
-        mime_type=mime_type, quote=quote, aspect_ratio=aspect_ratio,
+        file_url=file_url, mime_type=mime_type, quote=quote, aspect_ratio=aspect_ratio,
     )
     return client.poll_generation(chat_session_id)
 
