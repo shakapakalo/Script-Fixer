@@ -492,9 +492,55 @@ class ToolkitClient:
         except Exception as e:
             print(f"[agree] Warning (non-fatal): {e}")
 
+    def get_team_id(self) -> str:
+        """
+        Fetch the user's personal teamId required by createChatSession.
+        Strategy:
+          1. GET toolkit homepage — Next.js embeds user data in __NEXT_DATA__
+          2. Regex-search for "teamId" in the raw HTML
+          3. Fall back to /api/auth/session if not found in HTML
+        """
+        import re as _re
+        # 1 — toolkit homepage (Next.js SSR embeds user/team data)
+        try:
+            r = self._sess.get(TOOLKIT_BASE + "/", impersonate="chrome", timeout=30)
+            html = r.text
+            m = _re.search(r'"teamId"\s*:\s*"([0-9a-f-]{36})"', html)
+            if m:
+                tid = m.group(1)
+                print(f"[team] teamId from page: {tid[:8]}...")
+                return tid
+        except Exception as e:
+            print(f"[team] Homepage fetch failed: {e}")
+
+        # 2 — auth session endpoint
+        try:
+            r2 = self._sess.get(
+                TOOLKIT_BASE + "/api/auth/session",
+                impersonate="chrome", timeout=20,
+            )
+            data = r2.json()
+            # could be nested: data.user.teamId or data.teamId
+            tid = (
+                (data.get("user") or {}).get("teamId")
+                or data.get("teamId")
+            )
+            if tid:
+                print(f"[team] teamId from session: {tid[:8]}...")
+                return tid
+        except Exception as e:
+            print(f"[team] Session fetch failed: {e}")
+
+        raise RuntimeError(
+            "[team] Could not find teamId — unable to create chat session"
+        )
+
     def create_chat_session(self) -> str:
-        """POST chatSession.createChatSession → returns session id."""
-        result = self._post("chatSession.createChatSession", {"name": "My session"})
+        """POST chatSession.createChatSession → returns session id.
+        Requires teamId which is fetched from the toolkit page/session."""
+        team_id = self.get_team_id()
+        result = self._post("chatSession.createChatSession",
+                            {"name": "My session", "teamId": team_id})
         # Response: {data: {id: "..."}}  OR  {id: "..."}
         if isinstance(result, dict):
             sid = (result.get("data") or {}).get("id") or result.get("id") or ""
