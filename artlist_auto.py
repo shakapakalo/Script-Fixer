@@ -532,14 +532,16 @@ class ToolkitClient:
         file_url   = upload_info.get("fileUrl", "")  # bare S3 URL (no auth params)
 
         # Step 3 — PUT file to S3
+        # curl_cffi requires bytes/BytesIO, not a file handle
         print(f"[upload] Uploading {path.name} to S3 (key={file_key}) ...")
         with open(path, "rb") as fh:
-            put_r = self._sess.put(
-                put_url,
-                data=fh,
-                headers={"Content-Type": mime_type},
-                timeout=120,
-            )
+            file_bytes = fh.read()
+        put_r = self._sess.put(
+            put_url,
+            data=file_bytes,
+            headers={"Content-Type": mime_type},
+            timeout=120,
+        )
         if not put_r.ok:
             raise RuntimeError(f"[upload] S3 PUT failed {put_r.status_code}: {put_r.text[:200]}")
 
