@@ -742,6 +742,25 @@ def account_reset():
     return jsonify({"status": "ok", "message": "New account registered and ready"})
 
 
+@app.route("/config", methods=["POST"])
+def config_update():
+    """Update config.json values at runtime. Body: {key: value, ...}"""
+    data = request.get_json(silent=True) or {}
+    allowed = {"capsolver_key", "api_key", "port", "artlist_email", "artlist_password"}
+    updates = {k: v for k, v in data.items() if k in allowed}
+    if not updates:
+        return jsonify({"error": f"No valid keys. Allowed: {sorted(allowed)}"}), 400
+    current: dict = {}
+    if CONFIG_FILE.exists():
+        with open(CONFIG_FILE) as f:
+            current = json.load(f)
+    current.update(updates)
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(current, f, indent=2)
+    CONFIG.update(updates)
+    return jsonify({"status": "ok", "updated": list(updates.keys())})
+
+
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
