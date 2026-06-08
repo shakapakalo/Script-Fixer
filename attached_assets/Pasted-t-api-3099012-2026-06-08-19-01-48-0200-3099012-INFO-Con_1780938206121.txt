@@ -1,0 +1,19 @@
+t-api[3099012]: [2026-06-08 19:01:48 +0200] [3099012] [INFO] Control socket listening at /root/.gunicorn/gunicorn.ctl
+Jun 08 19:02:09 vmi3086586 artlist-api[3099034]: [worker] Job queue worker started.
+Jun 08 19:02:09 vmi3086586 artlist-api[3099034]: 34.93.34.198 - - [08/Jun/2026:19:02:09 +0200] "GET /health HTTP/1.1" 200 203 "-" "curl/8.14.1"
+Jun 08 19:02:29 vmi3086586 artlist-api[3099034]: [job] Created job a138d7a7 for: https://images.pexels.com/photos/1366919/pexels-photo-136691
+Jun 08 19:02:29 vmi3086586 artlist-api[3099034]: 34.93.34.198 - - [08/Jun/2026:19:02:29 +0200] "POST /job HTTP/1.1" 202 212 "-" "curl/8.14.1"
+Jun 08 19:02:35 vmi3086586 artlist-api[3099034]: [job:68c540ce] Starting attempt 2/5 ...
+Jun 08 19:02:35 vmi3086586 artlist-api[3099034]: [gen] Downloading: https://images.unsplash.com/photo-1506905925346-21bda4d32df4?w=800
+Jun 08 19:02:35 vmi3086586 artlist-api[3099034]: [gen] Attempt 1/3 (credit 0/2) ...
+Jun 08 19:02:35 vmi3086586 artlist-api[3099034]: [upload] Requesting signed upload URL for tmprjihwzzu.jpg ...
+Jun 08 19:02:35 vmi3086586 artlist-api[3099034]: [job:68c540ce] Attempt 2 failed [unknown]: HTTP Error 404:
+Jun 08 19:02:35 vmi3086586 artlist-api[3099034]: [job:68c540ce] Retry in 10min at 2026-06-08T17:12:33.679544+00:00.
+Jun 08 19:02:35 vmi3086586 artlist-api[3099034]: [job:a138d7a7] Starting attempt 1/5 ...
+Jun 08 19:02:35 vmi3086586 artlist-api[3099034]: [gen] Downloading: https://images.pexels.com/photos/1366919/pexels-photo-1366919.jpeg?w=800
+Jun 08 19:02:35 vmi3086586 artlist-api[3099034]: [gen] Attempt 1/3 (credit 0/2) ...
+Jun 08 19:02:35 vmi3086586 artlist-api[3099034]: [upload] Requesting signed upload URL for tmp5m3l786o.jpg ...
+Jun 08 19:02:35 vmi3086586 artlist-api[3099034]: [job:a138d7a7] Attempt 1 failed [unknown]: HTTP Error 404:
+Jun 08 19:02:35 vmi3086586 artlist-api[3099034]: [job:a138d7a7] Retry in 5min at 2026-06-08T17:07:33.944371+00:00.
+Jun 08 19:02:35 vmi3086586 artlist-api[3099034]: 34.93.34.198 - - [08/Jun/2026:19:02:35 +0200] "GET /job/a138d7a7-ab52-48e5-92db-8340ae49f6e2 HTTP/1.1" 200 350 "-" "curl/8.14.1"
+Jun 08 19:02:57 vmi3086586 artlist-api[3099034]: 34.93.34.198 - - [08/Jun/2026:19:02:57 +0200] "POST /config HTTP/1.1" 200 44 "-" "curl/8.14.1"

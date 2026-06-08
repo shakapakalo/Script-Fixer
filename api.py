@@ -356,16 +356,15 @@ def _run_generation(session: str, image_path: str,
     file_key, _, presigned_get, mime_type = client.upload_image(image_path)
     quote    = client.get_cost_quote(presigned_get, prompt=prompt, aspect_ratio=aspect_ratio)
 
-    if quote.get("cost", 0) > 0:
+    price = quote.get("cost") or quote.get("price") or 0
+    if price > 0:
         raise RuntimeError("OUT_OF_CREDITS: Account has no free generations left.")
 
-    chat_id  = client.create_chat_session()
-    client.create_generation(
+    chat_session_id = client.create_generation(
         prompt=prompt, file_key=file_key, presigned_get=presigned_get,
-        mime_type=mime_type, quote=quote, chat_session_id=chat_id,
-        aspect_ratio=aspect_ratio,
+        mime_type=mime_type, quote=quote, aspect_ratio=aspect_ratio,
     )
-    return client.poll_generation(chat_id)
+    return client.poll_generation(chat_session_id)
 
 # ─── Shared generation logic ──────────────────────────────────────────────────
 

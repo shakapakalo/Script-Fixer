@@ -485,7 +485,7 @@ class ToolkitClient:
         file_size = path.stat().st_size
 
         print(f"[upload] Requesting signed upload URL for {path.name} ...")
-        upload_info = self._post("assets.getSignedUploadUrl", {
+        upload_info = self._post("uploadRouter.getPresignedUrl", {
             "fileName":    path.name,
             "contentType": mime_type,
             "fileSize":    file_size,
@@ -505,109 +505,122 @@ class ToolkitClient:
         put_r.raise_for_status()
 
         print(f"[upload] Fetching presigned GET URL ...")
-        get_info    = self._get("assets.getPresignedGetUrl", {"fileKey": file_key})
-        presigned   = get_info.get("url") or get_info.get("presignedUrl") or get_info
+        get_info    = self._post("uploadRouter.getPresignedUrlFromKey", {
+            "fileKey":      file_key,
+            "expiresIn":    259200,
+            "verifyExists": True,
+        })
+        presigned   = get_info.get("presignedUrl") or get_info.get("url") or get_info
         if isinstance(presigned, dict):
-            presigned = presigned.get("url", bare_s3_url)
+            presigned = presigned.get("presignedUrl") or presigned.get("url") or bare_s3_url
 
         print(f"[upload] [OK] Done. fileKey={file_key}")
         return file_key, bare_s3_url, presigned, mime_type
 
     def get_cost_quote(self, presigned_get: str, prompt: str = "",
                        aspect_ratio: str = "auto") -> dict:
+        """
+        GET query — modelRouter.getCostQuote
+        Returns: {cost/price, digitalSignature, timestamp, modelId, modelFeature}
+        """
         print(f"[quote] Getting cost quote ...")
-        quote = self._post("generation.getCostQuote", {
-            "modelGroupId":    MODEL_GROUP_ID,
-            "feature":         FEATURE,
-            "referenceImages": [presigned_get],
-            "prompt":          prompt,
-            "aspectRatio":     aspect_ratio,
+        quote = self._get("modelRouter.getCostQuote", {
+            "modelGroupId": MODEL_GROUP_ID,
+            "input": {
+                "referenceImages": [presigned_get],
+                "prompt":          prompt,
+                "aspectRatio":     aspect_ratio,
+                "feature":         FEATURE,
+            },
         })
-        print(f"[quote] [OK] modelId={quote.get('modelId')}, cost={quote.get('cost')}")
+        cost = quote.get("cost") or quote.get("price") or 0
+        print(f"[quote] [OK] modelId={quote.get('modelId')}  cost={cost}  sig={'YES' if quote.get('digitalSignature') else 'NO'}")
         return quote
-
-    def create_chat_session(self) -> str:
-        chat_id = self._post("chat.createChatSession", {})
-        if isinstance(chat_id, str):
-            sid = chat_id
-        elif isinstance(chat_id, dict):
-            sid = chat_id.get("chatSessionId") or chat_id.get("id") or str(chat_id)
-        else:
-            sid = str(chat_id)
-        print(f"[session] [OK] Created chatSession: {sid}")
-        return sid
 
     def create_generation(self, prompt: str, file_key: str,
                           presigned_get: str, mime_type: str,
-                          quote: dict, chat_session_id: str,
+                          quote: dict,
                           aspect_ratio: str = "auto") -> str:
-        print(f"[gen] Creating generation (sessionId={chat_session_id}) ...")
-        result = self._post("generation.createUserGeneration", {
-            "chatSessionId":   chat_session_id,
-            "modelGroupId":    MODEL_GROUP_ID,
-            "feature":         FEATURE,
-            "prompt":          prompt,
-            "aspectRatio":     aspect_ratio,
-            "referenceImages": [presigned_get],
-            "fileKey":         file_key,
-            "mimeType":        mime_type,
-            "modelId":         quote.get("modelId"),
-            "cost":            quote.get("cost", 0),
-            "digitalSignature": quote.get("digitalSignature"),
+        """
+        POST mutation — userGenerationRouter.createUserGeneration
+        chatSessionId is generated client-side (UUID); server uses it as grouping key.
+        Returns chatSessionId for polling.
+        """
+        chat_session_id = _uuidv7()
+        feature = quote.get("modelFeature") or FEATURE
+        print(f"[gen] Creating generation (session={chat_session_id[:8]}) ...")
+        result = self._post("userGenerationRouter.createUserGeneration", {
+            "chatSessionId":              chat_session_id,
+            "inputs": {
+                "referenceImages": [presigned_get],
+                "prompt":          prompt,
+                "aspectRatio":     aspect_ratio,
+                "feature":         feature,
+            },
+            "artifacts":                  [{"fileKey": file_key}],
+            "modelGroupId":               quote.get("modelId") or MODEL_GROUP_ID,
+            "feature":                    feature,
+            "price":                      quote.get("cost") or quote.get("price") or 0,
+            "costQuoteDigitalSignature":   quote.get("digitalSignature", ""),
+            "timestamp":                  quote.get("timestamp") or int(time.time() * 1000),
+            "generationMethod":           "FREE" if (quote.get("cost") or quote.get("price") or 0) == 0 else None,
         })
         print(f"[gen] [OK] Submitted. Waiting for result ...")
         if isinstance(result, dict):
-            return result.get("chatSessionId", chat_session_id)
+            return result.get("chatSessionId") or chat_session_id
         return chat_session_id
 
     def poll_generation(self, chat_session_id: str) -> list[str]:
+        """
+        Poll via userGenerationRouter.getUserGenerationsBySession
+        until status COMPLETED/DONE or timeout.
+        """
         start = time.time()
         while True:
             elapsed = int(time.time() - start)
             if elapsed > POLL_TIMEOUT:
-                raise TimeoutError(
-                    f"Generation timed out after {POLL_TIMEOUT}s"
-                )
-            print(f"[poll] status=processing ({elapsed}s)")
+                raise TimeoutError(f"Generation timed out after {POLL_TIMEOUT}s")
+            print(f"[poll] status=processing ({elapsed}s) ...")
             time.sleep(POLL_INTERVAL)
 
             try:
-                messages = self._get("chat.getChatMessages",
-                                     {"chatSessionId": chat_session_id})
+                data = self._get("userGenerationRouter.getUserGenerationsBySession", {
+                    "sessionId": chat_session_id,
+                    "perPage":   10,
+                })
             except Exception as e:
-                print(f"[poll] Error fetching messages: {e}")
+                print(f"[poll] fetch error: {e}")
                 continue
 
-            if isinstance(messages, list):
-                msg_list = messages
-            elif isinstance(messages, dict):
-                msg_list = messages.get("messages") or messages.get("items") or []
-            else:
-                continue
+            items = []
+            if isinstance(data, dict):
+                items = data.get("items") or data.get("generations") or []
+            elif isinstance(data, list):
+                items = data
 
             urls: list[str] = []
-            for msg in msg_list:
-                role = msg.get("role") or msg.get("type") or ""
-                if role not in ("assistant", "bot", "system", ""):
-                    continue
-                content = msg.get("content") or msg.get("message") or ""
-                if isinstance(content, list):
-                    for block in content:
-                        if isinstance(block, dict) and block.get("type") == "image":
-                            u = block.get("url") or block.get("src") or ""
-                            if u:
-                                urls.append(u)
-                if isinstance(content, str) and content.startswith("http"):
-                    urls.append(content)
-                for k in ("imageUrl", "url", "image_url", "outputUrl"):
-                    v = msg.get(k) or ""
-                    if isinstance(v, str) and v.startswith("http"):
-                        urls.append(v)
+            for item in items:
+                status = (item.get("status") or "").upper()
+                if status in ("COMPLETED", "DONE", "SUCCESS"):
+                    for out in item.get("outputs") or []:
+                        u = out.get("url") or out.get("outputUrl") or out.get("src") or ""
+                        if isinstance(u, str) and u.startswith("http"):
+                            urls.append(u)
+                    # Also check top-level url fields
+                    for k in ("url", "outputUrl", "imageUrl"):
+                        v = item.get(k) or ""
+                        if isinstance(v, str) and v.startswith("http"):
+                            urls.append(v)
+                elif status in ("FAILED", "ERROR", "CANCELLED"):
+                    raise RuntimeError(
+                        f"Generation failed (status={status}): "
+                        f"{item.get('error') or item.get('errorMessage') or 'unknown'}"
+                    )
 
             if urls:
                 elapsed = int(time.time() - start)
                 print(f"[poll] status=completed ({elapsed}s)")
-                return list(dict.fromkeys(urls))  # deduplicate, preserve order
+                return list(dict.fromkeys(urls))
 
 
 # ─── High-level pipeline ──────────────────────────────────────────────────────
@@ -619,14 +632,12 @@ def _run_one(client: "ToolkitClient", image_path: str, prompt: str,
 
     file_key, _, presigned_get, mime_type = client.upload_image(image_path)
     quote           = client.get_cost_quote(presigned_get, prompt=prompt, aspect_ratio=aspect_ratio)
-    chat_session_id = client.create_chat_session()
     chat_session_id = client.create_generation(
         prompt=prompt,
         file_key=file_key,
         presigned_get=presigned_get,
         mime_type=mime_type,
         quote=quote,
-        chat_session_id=chat_session_id,
         aspect_ratio=aspect_ratio,
     )
     return client.poll_generation(chat_session_id)
