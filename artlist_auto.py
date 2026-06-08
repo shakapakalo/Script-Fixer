@@ -482,7 +482,33 @@ class ToolkitClient:
         d = item["result"]["data"]
         return d.get("json", d)
 
+    def upsert_agreement(self, name: str = "toolkit-file-upload-agreement") -> None:
+        """Accept the file-upload terms (required before upload).  Silently ignored if already accepted."""
+        try:
+            self._post("userAgreementsRouter.upsertAgreement", {"agreementName": name})
+            print(f"[agree] File-upload agreement accepted.")
+        except Exception as e:
+            print(f"[agree] Warning (non-fatal): {e}")
+
+    def create_chat_session(self) -> str:
+        """POST chatSession.createChatSession → returns session id."""
+        result = self._post("chatSession.createChatSession", {"name": "My session"})
+        # Response: {data: {id: "..."}}  OR  {id: "..."}
+        if isinstance(result, dict):
+            sid = (result.get("data") or {}).get("id") or result.get("id") or ""
+        else:
+            sid = str(result)
+        if not sid:
+            raise RuntimeError(f"[chatSession] Could not extract session id from: {result}")
+        print(f"[session] Created chatSession id={sid[:8]}...")
+        return sid
+
     def upload_image(self, image_path: str) -> tuple[str, str, str, str]:
+        """Upload image to S3 via signed URL.
+        Returns: (file_key, file_url, presigned_get_url, mime_type)
+          - file_url         = bare S3 URL (no auth params)
+          - presigned_get_url= signed GET URL (used in inputs + getCostQuote)
+        """
         path = Path(image_path)
         mime_map = {
             ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
@@ -490,136 +516,156 @@ class ToolkitClient:
             ".gif": "image/gif",
         }
         mime_type = mime_map.get(path.suffix.lower(), "image/jpeg")
-        file_size = path.stat().st_size
 
-        print(f"[upload] Requesting signed upload URL for {path.name} ...")
+        # Step 1 — accept file-upload agreement (idempotent)
+        self.upsert_agreement()
+
+        # Step 2 — get a PUT pre-signed URL
+        print(f"[upload] Requesting signed upload URL for {path.name} ({mime_type}) ...")
         upload_info = self._post("uploadRouter.getPresignedUrl", {
-            "fileName":    path.name,
-            "contentType": mime_type,
-            "fileSize":    file_size,
+            "fileName":  path.name,
+            "fileType":  mime_type,
+            "expiresIn": 86400,
         })
-        file_key      = upload_info["fileKey"]
-        upload_url    = upload_info["uploadUrl"]
-        bare_s3_url   = upload_info.get("url", "")
+        file_key   = upload_info["fileKey"]
+        put_url    = upload_info["presignedUrl"]      # PUT to S3
+        file_url   = upload_info.get("fileUrl", "")  # bare S3 URL (no auth params)
 
+        # Step 3 — PUT file to S3
         print(f"[upload] Uploading {path.name} to S3 (key={file_key}) ...")
         with open(path, "rb") as fh:
             put_r = self._sess.put(
-                upload_url,
+                put_url,
                 data=fh,
                 headers={"Content-Type": mime_type},
                 timeout=120,
             )
-        put_r.raise_for_status()
+        if not put_r.ok:
+            raise RuntimeError(f"[upload] S3 PUT failed {put_r.status_code}: {put_r.text[:200]}")
 
+        # Step 4 — get a GET pre-signed URL for model inference
         print(f"[upload] Fetching presigned GET URL ...")
-        get_info    = self._post("uploadRouter.getPresignedUrlFromKey", {
-            "fileKey":      file_key,
-            "expiresIn":    259200,
-            "verifyExists": True,
+        get_info      = self._post("uploadRouter.getPresignedUrlFromKey", {
+            "fileKey": file_key,
         })
-        presigned   = get_info.get("presignedUrl") or get_info.get("url") or get_info
-        if isinstance(presigned, dict):
-            presigned = presigned.get("presignedUrl") or presigned.get("url") or bare_s3_url
+        presigned_get = get_info.get("presignedUrl") or get_info.get("url") or file_url
 
-        print(f"[upload] [OK] Done. fileKey={file_key}")
-        return file_key, bare_s3_url, presigned, mime_type
+        print(f"[upload] [OK] fileKey={file_key}")
+        return file_key, file_url, presigned_get, mime_type
 
-    def get_cost_quote(self, presigned_get: str, prompt: str = "",
-                       aspect_ratio: str = "auto") -> dict:
+    def get_cost_quote(self, presigned_get: str, file_url: str = "",
+                       prompt: str = "", aspect_ratio: str = "auto") -> dict:
         """
-        GET query — modelRouter.getCostQuote
-        Returns: {cost/price, digitalSignature, timestamp, modelId, modelFeature}
+        POST mutation — modelRouter.getCostQuote
+        Uses the presigned GET URL in image_urls so the server can inspect the image.
+        Returns the unwrapped data dict: {modelId, cost, modelFeature, digitalSignature?, ...}
         """
-        print(f"[quote] Getting cost quote ...")
-        quote = self._get("modelRouter.getCostQuote", {
+        image_ref = presigned_get or file_url
+        print(f"[quote] Getting cost quote (model={MODEL_GROUP_ID}) ...")
+        raw = self._post("modelRouter.getCostQuote", {
             "modelGroupId": MODEL_GROUP_ID,
             "input": {
-                "referenceImages": [presigned_get],
-                "prompt":          prompt,
-                "aspectRatio":     aspect_ratio,
-                "feature":         FEATURE,
+                "prompt":      prompt,
+                "num_images":  1,
+                "aspect_ratio": aspect_ratio,
+                "image_urls":  [{"fileUrl": image_ref}],
             },
         })
-        cost = quote.get("cost") or quote.get("price") or 0
-        print(f"[quote] [OK] modelId={quote.get('modelId')}  cost={cost}  sig={'YES' if quote.get('digitalSignature') else 'NO'}")
+        # Unwrap {success: true, data: {...}} wrapper
+        if isinstance(raw, dict) and raw.get("success") and "data" in raw:
+            quote = raw["data"]
+        else:
+            quote = raw
+        cost = quote.get("cost", 0)
+        sig  = "YES" if quote.get("digitalSignature") else "NO"
+        print(f"[quote] [OK] modelId={quote.get('modelId')}  cost={cost}  sig={sig}  feature={quote.get('modelFeature')}")
         return quote
 
     def create_generation(self, prompt: str, file_key: str,
-                          presigned_get: str, mime_type: str,
-                          quote: dict,
+                          presigned_get: str, file_url: str,
+                          mime_type: str, quote: dict,
                           aspect_ratio: str = "auto") -> str:
         """
         POST mutation — userGenerationRouter.createUserGeneration
-        chatSessionId is generated client-side (UUID); server uses it as grouping key.
+        Creates a chat session first, then submits the generation.
         Returns chatSessionId for polling.
         """
-        chat_session_id = _uuidv7()
-        feature = quote.get("modelFeature") or FEATURE
-        print(f"[gen] Creating generation (session={chat_session_id[:8]}) ...")
+        chat_session_id = self.create_chat_session()
+        feature         = quote.get("modelFeature") or FEATURE
+        model_id        = quote.get("modelId") or MODEL_GROUP_ID
+        price           = quote.get("cost", 0)
+
+        # inputs must use the presigned GET URL (same as final getCostQuote)
+        inputs = {
+            "prompt":     prompt,
+            "image_urls": [{"fileUrl": presigned_get}],
+        }
+        settings = {
+            "prompt":       prompt,
+            "num_images":   1,
+            "aspect_ratio": aspect_ratio,
+        }
+
+        print(f"[gen] Submitting generation (session={chat_session_id[:8]}  model={model_id}) ...")
         result = self._post("userGenerationRouter.createUserGeneration", {
-            "chatSessionId":              chat_session_id,
-            "inputs": {
-                "referenceImages": [presigned_get],
-                "prompt":          prompt,
-                "aspectRatio":     aspect_ratio,
-                "feature":         feature,
-            },
-            "artifacts":                  [{"fileKey": file_key}],
-            "modelGroupId":               quote.get("modelId") or MODEL_GROUP_ID,
-            "feature":                    feature,
-            "price":                      quote.get("cost") or quote.get("price") or 0,
-            "costQuoteDigitalSignature":   quote.get("digitalSignature", ""),
-            "timestamp":                  quote.get("timestamp") or int(time.time() * 1000),
-            "generationMethod":           "FREE" if (quote.get("cost") or quote.get("price") or 0) == 0 else None,
+            "chatSessionId": chat_session_id,
+            "inputs":        inputs,
+            "modelGroupId":  model_id,
+            "feature":       feature,
+            "price":         price,
+            "settings":      settings,
+            "artifacts": [{
+                "fileKey":  file_key,
+                "metadata": {"fileUrl": presigned_get},
+            }],
         })
-        print(f"[gen] [OK] Submitted. Waiting for result ...")
+        # Response: {success: true, data: {id: "..."}}
         if isinstance(result, dict):
-            return result.get("chatSessionId") or chat_session_id
+            if result.get("success") and "data" in result:
+                gen_id = result["data"].get("id", "")
+                print(f"[gen] [OK] generationId={gen_id[:8]}...")
+        print(f"[gen] Waiting for completion ...")
         return chat_session_id
 
     def poll_generation(self, chat_session_id: str) -> list[str]:
         """
-        Poll via userGenerationRouter.getUserGenerationsBySession
-        until status COMPLETED/DONE or timeout.
+        Poll getUserGenerationsBySession until status=completed or timeout.
+        Completed item has thumbnailUrl / fileUrl at top level (no nested outputs array).
         """
         start = time.time()
         while True:
             elapsed = int(time.time() - start)
             if elapsed > POLL_TIMEOUT:
                 raise TimeoutError(f"Generation timed out after {POLL_TIMEOUT}s")
-            print(f"[poll] status=processing ({elapsed}s) ...")
+            print(f"[poll] waiting... ({elapsed}s elapsed)")
             time.sleep(POLL_INTERVAL)
 
             try:
                 data = self._get("userGenerationRouter.getUserGenerationsBySession", {
                     "sessionId": chat_session_id,
-                    "perPage":   10,
                 })
             except Exception as e:
-                print(f"[poll] fetch error: {e}")
+                print(f"[poll] fetch error (retrying): {e}")
                 continue
 
-            items = []
+            # Response shape: {items: [...], pagination: {...}}
+            items: list = []
             if isinstance(data, dict):
-                items = data.get("items") or data.get("generations") or []
+                items = data.get("items") or data.get("data", {}).get("items") or []
             elif isinstance(data, list):
                 items = data
 
             urls: list[str] = []
             for item in items:
-                status = (item.get("status") or "").upper()
-                if status in ("COMPLETED", "DONE", "SUCCESS"):
-                    for out in item.get("outputs") or []:
-                        u = out.get("url") or out.get("outputUrl") or out.get("src") or ""
-                        if isinstance(u, str) and u.startswith("http"):
-                            urls.append(u)
-                    # Also check top-level url fields
-                    for k in ("url", "outputUrl", "imageUrl"):
-                        v = item.get(k) or ""
+                status = (item.get("status") or "").lower()
+                if status == "completed":
+                    # Output URL lives directly on the item (not nested)
+                    for key in ("thumbnailUrl", "fileUrl", "url", "outputUrl", "imageUrl"):
+                        v = item.get(key) or ""
                         if isinstance(v, str) and v.startswith("http"):
                             urls.append(v)
-                elif status in ("FAILED", "ERROR", "CANCELLED"):
+                            break
+                elif status in ("failed", "error", "cancelled"):
                     raise RuntimeError(
                         f"Generation failed (status={status}): "
                         f"{item.get('error') or item.get('errorMessage') or 'unknown'}"
@@ -627,7 +673,7 @@ class ToolkitClient:
 
             if urls:
                 elapsed = int(time.time() - start)
-                print(f"[poll] status=completed ({elapsed}s)")
+                print(f"[poll] [OK] Completed in {elapsed}s  urls={len(urls)}")
                 return list(dict.fromkeys(urls))
 
 
@@ -638,12 +684,14 @@ def _run_one(client: "ToolkitClient", image_path: str, prompt: str,
     label = f"[{idx}/{total}]"
     print(f"\n{label} ── Starting generation {idx} of {total} ──")
 
-    file_key, _, presigned_get, mime_type = client.upload_image(image_path)
-    quote           = client.get_cost_quote(presigned_get, prompt=prompt, aspect_ratio=aspect_ratio)
+    file_key, file_url, presigned_get, mime_type = client.upload_image(image_path)
+    quote           = client.get_cost_quote(presigned_get, file_url=file_url,
+                                            prompt=prompt, aspect_ratio=aspect_ratio)
     chat_session_id = client.create_generation(
         prompt=prompt,
         file_key=file_key,
         presigned_get=presigned_get,
+        file_url=file_url,
         mime_type=mime_type,
         quote=quote,
         aspect_ratio=aspect_ratio,
