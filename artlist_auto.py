@@ -100,7 +100,9 @@ def solve_turnstile(capsolver_key: str, turnstile_site_key: str,
                     "websiteKey": turnstile_site_key,
                 },
             }, timeout=30)
-            r.raise_for_status()
+            if not r.ok:
+                print(f"[capsolver] createTask HTTP {r.status_code}: {r.text[:400]}")
+                r.raise_for_status()
             data = r.json()
             if data.get("errorId"):
                 raise RuntimeError(f"[capsolver] Create task error: {data.get('errorDescription')}")

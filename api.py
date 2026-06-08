@@ -562,6 +562,33 @@ def health():
     })
 
 
+@app.route("/debug", methods=["GET"])
+def debug():
+    """Diagnostic endpoint — shows config (key masked), state, pool accounts (sanitized)."""
+    state    = _load_state()
+    accounts = _pool_load(str(ACCOUNTS_FILE))
+    safe_accs = [
+        {
+            "email":      a.get("email", ""),
+            "exhausted":  a.get("exhausted", False),
+            "has_token":  bool(a.get("session_token")),
+            "token_tail": (a.get("session_token") or "")[-8:],
+        }
+        for a in accounts
+    ]
+    cap_key = CONFIG.get("capsolver_key", "")
+    return jsonify({
+        "capsolver_key":      (cap_key[:6] + "…" + cap_key[-6:]) if len(cap_key) > 12 else ("SET" if cap_key else "NOT SET"),
+        "capsolver_key_len":  len(cap_key),
+        "api_key_set":        bool(CONFIG.get("api_key")),
+        "images_used":        state.get("images_used", 0),
+        "has_session":        bool(state.get("session")),
+        "session_tail":       (state.get("session") or "")[-12:],
+        "pool_accounts":      safe_accs,
+        "max_per_account":    MAX_IMAGES_PER_ACCOUNT,
+    })
+
+
 # ── Synchronous /generate (backward-compatible, unchanged behaviour) ──────────
 
 @app.route("/generate", methods=["POST"])
