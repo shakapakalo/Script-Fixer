@@ -465,7 +465,15 @@ class ToolkitClient:
 
     @staticmethod
     def _parse(r: requests.Response, label: str) -> dict:
-        r.raise_for_status()
+        if not r.ok:
+            try:
+                body = r.json()
+                item = body[0] if isinstance(body, list) else body
+                err  = item.get("error", {}).get("json", {})
+                msg  = err.get("message") or str(body)[:300]
+            except Exception:
+                msg = r.text[:300]
+            raise RuntimeError(f"[{label}] HTTP {r.status_code}: {msg}")
         body = r.json()
         item = body[0] if isinstance(body, list) else body
         if item.get("error"):
