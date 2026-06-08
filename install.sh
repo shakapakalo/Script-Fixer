@@ -7,8 +7,7 @@ set -e
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 SERVICE="artlist-api"
 PORT=9222
-PYTHON=python3
-PIP=pip3
+VENV="$REPO_DIR/.venv"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 log()  { echo -e "${GREEN}[install]${NC} $*"; }
@@ -24,7 +23,6 @@ log "═════════════════════════
 # ── 1. Kill anything already on port 9222 ────────────────────────
 log "Stopping any process on port $PORT ..."
 fuser -k ${PORT}/tcp 2>/dev/null && log "Killed old process on :$PORT" || log "Port $PORT was free"
-# Also stop systemd service if it exists
 if systemctl is-active --quiet "$SERVICE" 2>/dev/null; then
     systemctl stop "$SERVICE"
     log "Stopped systemd service: $SERVICE"
@@ -32,24 +30,20 @@ fi
 
 # ── 2. System packages ───────────────────────────────────────────
 log "Installing system packages ..."
-if command -v apt-get &>/dev/null; then
-    apt-get update -qq
-    apt-get install -y -qq python3 python3-pip python3-venv curl git \
-        libssl-dev libffi-dev build-essential
-elif command -v yum &>/dev/null; then
-    yum install -y python3 python3-pip curl git openssl-devel libffi-devel gcc
-else
-    warn "Unknown package manager — skipping system packages. Make sure python3 & pip3 are installed."
-fi
+apt-get update -qq
+apt-get install -y -qq \
+    python3 python3-pip python3-venv python3-full \
+    curl git libssl-dev libffi-dev build-essential
 
-# ── 3. Verify Python ─────────────────────────────────────────────
-$PYTHON --version || die "python3 not found"
-$PIP    --version || die "pip3 not found"
+# ── 3. Create virtual environment ────────────────────────────────
+log "Creating Python venv at $VENV ..."
+python3 -m venv "$VENV"
+log "Venv created."
 
-# ── 4. Python dependencies ───────────────────────────────────────
-log "Installing Python packages ..."
-$PIP install --upgrade pip --quiet
-$PIP install flask gunicorn requests curl_cffi Pillow --quiet
+# ── 4. Install Python packages inside venv ───────────────────────
+log "Installing Python packages into venv ..."
+"$VENV/bin/pip" install --upgrade pip --quiet
+"$VENV/bin/pip" install flask gunicorn requests curl_cffi Pillow --quiet
 log "Python packages installed."
 
 # ── 5. Create systemd service ────────────────────────────────────
@@ -66,7 +60,7 @@ StartLimitBurst=5
 Type=simple
 User=root
 WorkingDirectory=${REPO_DIR}
-ExecStart=/usr/bin/gunicorn api:app \\
+ExecStart=${VENV}/bin/gunicorn api:app \\
     --bind 0.0.0.0:${PORT} \\
     --workers 1 \\
     --threads 4 \\

@@ -36,9 +36,14 @@ else
 fi
 
 # ── 2. Update Python packages if requirements.txt changed ────────
+VENV="$REPO_DIR/.venv"
+if [ ! -d "$VENV" ]; then
+    warn "Venv not found — run bash install.sh first to set up."
+    exit 1
+fi
 if git diff --name-only "$BEFORE" "$AFTER" | grep -q "requirements.txt"; then
     log "requirements.txt changed — installing new packages ..."
-    pip3 install -r requirements.txt --quiet
+    "$VENV/bin/pip" install -r requirements.txt --quiet
     log "Packages updated."
 else
     log "requirements.txt unchanged — skipping pip install."
@@ -46,14 +51,13 @@ fi
 
 # ── 3. Restart service ───────────────────────────────────────────
 log "Restarting service: $SERVICE ..."
-if systemctl is-active --quiet "$SERVICE" 2>/dev/null; then
+if systemctl is-active --quiet "$SERVICE" 2>/dev/null || systemctl is-enabled --quiet "$SERVICE" 2>/dev/null; then
     systemctl restart "$SERVICE"
 else
-    warn "Service not found via systemd. Trying to kill old process and start fresh ..."
+    warn "Service not found via systemd. Starting directly ..."
     fuser -k ${PORT}/tcp 2>/dev/null || true
     sleep 1
-    cd "$REPO_DIR"
-    nohup gunicorn api:app \
+    nohup "$VENV/bin/gunicorn" api:app \
         --bind 0.0.0.0:${PORT} \
         --workers 1 \
         --threads 4 \
