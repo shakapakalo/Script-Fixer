@@ -425,15 +425,25 @@ def get_session_token(args) -> str:
 
 class ToolkitClient:
     def __init__(self, session_token: str, proxy: str | None = None):
-        self._sess = _make_session(proxy)
-        self._sess.cookies.set(SESSION_COOKIE, session_token,
-                               domain="toolkit.artlist.io")
+        # Use curl_cffi (Chrome TLS impersonation) — toolkit.artlist.io has
+        # Cloudflare protection that blocks plain Python requests.
+        self._sess = cf_requests.Session()
         self._sess.headers.update({
+            "User-Agent":     UA,
             "Origin":         TOOLKIT_BASE,
             "Referer":        f"{TOOLKIT_BASE}/",
             "Content-Type":   "application/json",
             "x-trpc-source":  "nextjs-react",
         })
+        if proxy:
+            self._sess.proxies = {"http": proxy, "https": proxy}
+
+        # Set the session cookie on the root domain (.artlist.io) so it is
+        # automatically sent to BOTH artlist.io AND toolkit.artlist.io.
+        # Also set it explicitly on toolkit.artlist.io as a belt-and-suspenders
+        # measure for strict cookie-jar implementations.
+        for domain in (".artlist.io", "toolkit.artlist.io", "artlist.io"):
+            self._sess.cookies.set(SESSION_COOKIE, session_token, domain=domain)
 
     def _post(self, procedure: str, data: dict, meta: dict | None = None) -> dict:
         body: dict = {"json": data}
@@ -442,13 +452,15 @@ class ToolkitClient:
         rid = _uuidv7()
         url = f"{TOOLKIT_BASE}/api/trpc/{procedure}"
         r = self._sess.post(url, json=body,
-                            headers={"x-request-id": rid}, timeout=45)
+                            headers={"x-request-id": rid},
+                            timeout=45, impersonate="chrome")
         return self._parse(r, procedure)
 
     def _get(self, procedure: str, data: dict) -> dict:
         inp = json.dumps({"json": data})
         url = f"{TOOLKIT_BASE}/api/trpc/{procedure}"
-        r = self._sess.get(url, params={"input": inp}, timeout=45)
+        r = self._sess.get(url, params={"input": inp},
+                           timeout=45, impersonate="chrome")
         return self._parse(r, procedure)
 
     @staticmethod
