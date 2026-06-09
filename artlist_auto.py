@@ -494,46 +494,17 @@ class ToolkitClient:
 
     def get_team_id(self) -> str:
         """
-        Fetch the user's personal teamId required by createChatSession.
-        Strategy:
-          1. GET toolkit homepage — Next.js embeds user data in __NEXT_DATA__
-          2. Regex-search for "teamId" in the raw HTML
-          3. Fall back to /api/auth/session if not found in HTML
+        Return a teamId for createChatSession.
+
+        The toolkit frontend JS does:
+            teamId: i || crypto.randomUUID()
+        i.e. it generates a fresh random UUID when no team exists.
+        We mirror that behaviour exactly.
         """
-        import re as _re
-        # 1 — toolkit homepage (Next.js SSR embeds user/team data)
-        try:
-            r = self._sess.get(TOOLKIT_BASE + "/", impersonate="chrome", timeout=30)
-            html = r.text
-            m = _re.search(r'"teamId"\s*:\s*"([0-9a-f-]{36})"', html)
-            if m:
-                tid = m.group(1)
-                print(f"[team] teamId from page: {tid[:8]}...")
-                return tid
-        except Exception as e:
-            print(f"[team] Homepage fetch failed: {e}")
-
-        # 2 — auth session endpoint
-        try:
-            r2 = self._sess.get(
-                TOOLKIT_BASE + "/api/auth/session",
-                impersonate="chrome", timeout=20,
-            )
-            data = r2.json()
-            # could be nested: data.user.teamId or data.teamId
-            tid = (
-                (data.get("user") or {}).get("teamId")
-                or data.get("teamId")
-            )
-            if tid:
-                print(f"[team] teamId from session: {tid[:8]}...")
-                return tid
-        except Exception as e:
-            print(f"[team] Session fetch failed: {e}")
-
-        raise RuntimeError(
-            "[team] Could not find teamId — unable to create chat session"
-        )
+        import uuid as _uuid
+        tid = str(_uuid.uuid4())
+        print(f"[team] teamId (random UUID): {tid}")
+        return tid
 
     def create_chat_session(self) -> str:
         """POST chatSession.createChatSession → returns session id.
@@ -656,19 +627,26 @@ class ToolkitClient:
             "aspect_ratio": aspect_ratio,
         }
 
-        print(f"[gen] Submitting generation (session={chat_session_id[:8]}  model={model_id}) ...")
-        result = self._post("userGenerationRouter.createUserGeneration", {
-            "chatSessionId": chat_session_id,
-            "inputs":        inputs,
-            "modelGroupId":  model_id,
-            "feature":       feature,
-            "price":         price,
-            "settings":      settings,
+        digital_sig = quote.get("digitalSignature") or ""
+        timestamp   = quote.get("timestamp") or int(time.time() * 1000)
+
+        payload: dict = {
+            "chatSessionId":              chat_session_id,
+            "inputs":                     inputs,
+            "modelGroupId":               model_id,
+            "feature":                    feature,
+            "price":                      price,
+            "settings":                   settings,
+            "costQuoteDigitalSignature":  digital_sig,
+            "timestamp":                  timestamp,
             "artifacts": [{
                 "fileKey":  file_key,
                 "metadata": {"fileUrl": presigned_get},
             }],
-        })
+        }
+
+        print(f"[gen] Submitting generation (session={chat_session_id[:8]}  model={model_id}) ...")
+        result = self._post("userGenerationRouter.createUserGeneration", payload)
         # Response: {success: true, data: {id: "..."}}
         if isinstance(result, dict):
             if result.get("success") and "data" in result:

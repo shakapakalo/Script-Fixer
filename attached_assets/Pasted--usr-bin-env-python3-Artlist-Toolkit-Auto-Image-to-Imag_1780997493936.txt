@@ -1,0 +1,905 @@
+#!/usr/bin/env python3
+"""
+Artlist Toolkit — Auto Image-to-Image Generator
+================================================
+Usage:
+  # Generate 2 images with 1 account:
+  python artlist_auto.py --image photo.jpg --prompt "neon city" --session "eyJ..." --count 2
+
+  # Auto-register new account via CapSolver then generate:
+  python artlist_auto.py --image photo.jpg --prompt "neon city" --count 2 \
+      --capsolver-key "CAP-xxxx" --turnstile-site-key "0x4AAAxxxxxx"
+
+  # Use account pool (accounts.json) — auto-rotates when one expires:
+  python artlist_auto.py --image photo.jpg --prompt "neon city" --count 2 \
+      --accounts accounts.json --capsolver-key "CAP-xxxx" --turnstile-site-key "0x4AAAxxxxxx"
+
+  # Register a new account and save to pool:
+  python artlist_auto.py --register \
+      --capsolver-key "CAP-xxxx" --turnstile-site-key "0x4AAAxxxxxx" \
+      --accounts accounts.json
+
+Environment variables:
+  ARTLIST_SESSION        — session JWT
+  ARTLIST_EMAIL          — account email
+  ARTLIST_PASSWORD       — account password
+  ARTLIST_PROXY          — proxy URL
+  CAPSOLVER_API_KEY      — CapSolver API key (capsolver.com)
+  ARTLIST_TURNSTILE_KEY  — Turnstile site key (find in DevTools — see --find-site-key)
+
+How to find the Turnstile site key:
+  1. Open https://artlist.io/start-now in Chrome
+  2. Press F12 → Network tab → filter "challenges.cloudflare.com"
+  3. Look for a request URL containing "sitekey=0x4AAA..."
+  4. Copy the sitekey value → use as --turnstile-site-key
+
+Steps performed:
+  1. Auth   — login / register / rotate account pool
+  2. Upload — upload source image to S3 via presigned URL
+  3. Quote  — getCostQuote → modelId + digitalSignature
+  4. Session— createChatSession → server-assigned chatSessionId
+  5. Gen    — createUserGeneration
+  6. Poll   — wait for result → print output image URL(s)
+"""
+
+import argparse
+import json
+import os
+import random
+import string
+import sys
+import time
+from pathlib import Path
+
+import requests
+from curl_cffi import requests as cf_requests
+
+# ─── Constants ────────────────────────────────────────────────────────────────
+
+ARTLIST_BASE    = "https://artlist.io"
+TOOLKIT_BASE    = "https://toolkit.artlist.io"
+SESSION_COOKIE  = "__Secure-session.artlist-prod.session-token"
+
+MODEL_GROUP_ID  = 345    # Flux image-to-image
+FEATURE         = "image-to-image"
+POLL_INTERVAL   = 4      # seconds
+POLL_TIMEOUT    = 180    # max seconds
+
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36")
+
+
+# ─── Tiny helpers ─────────────────────────────────────────────────────────────
+
+def _rstr(n: int = 8) -> str:
+    return "".join(random.choices(string.ascii_lowercase, k=n))
+
+def _random_email() -> str:
+    return f"{_rstr(8)}.{_rstr(5)}@gmail.com"
+
+def _random_password() -> str:
+    return f"P@{_rstr(5)}!{random.randint(10,99)}z"
+
+def _uuidv7() -> str:
+    """Generate a UUIDv7 (time-ordered) string."""
+    ts   = int(time.time() * 1000)
+    rand = "".join(random.choices("0123456789abcdef", k=20))
+    th   = f"{ts:012x}"
+    var  = hex(random.randint(8, 11))[2]
+    return f"{th[:8]}-{th[8:12]}-7{rand[:3]}-{var}{rand[3:6]}-{rand[6:18]}"
+
+
+# ─── HTTP session factory ─────────────────────────────────────────────────────
+
+def _make_session(proxy: str | None = None) -> requests.Session:
+    s = requests.Session()
+    s.headers["User-Agent"] = UA
+    if proxy:
+        s.proxies = {"http": proxy, "https": proxy}
+    return s
+
+
+# ─── CapSolver — Turnstile solver ─────────────────────────────────────────────
+
+def solve_turnstile(capsolver_key: str, turnstile_site_key: str,
+                    page_url: str = "https://artlist.io/start-now") -> str:
+    """
+    Use CapSolver REST API to solve Cloudflare Turnstile.
+    Returns the turnstile token string.
+
+    capsolver_key      — your CapSolver API key (capsolver.com)
+    turnstile_site_key — the 0x4AAA... key from the Artlist registration page
+                         (find it: DevTools → Network → filter challenges.cloudflare.com
+                          → look for sitekey= in the request URL)
+    """
+    CAPSOLVER_API = "https://api.capsolver.com"
+
+    print("[capsolver] Creating Turnstile task ...")
+    r = requests.post(f"{CAPSOLVER_API}/createTask", json={
+        "clientKey": capsolver_key,
+        "task": {
+            "type":       "AntiTurnstileTaskProxyLess",
+            "websiteURL": page_url,
+            "websiteKey": turnstile_site_key,
+        },
+    }, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    if data.get("errorId"):
+        raise RuntimeError(f"[capsolver] Create task error: {data.get('errorDescription')}")
+    task_id = data["taskId"]
+    print(f"[capsolver] Task created: {task_id} — polling ...")
+
+    for _ in range(60):   # max 60 × 3s = 3 min
+        time.sleep(3)
+        r2 = requests.post(f"{CAPSOLVER_API}/getTaskResult", json={
+            "clientKey": capsolver_key,
+            "taskId":    task_id,
+        }, timeout=15)
+        r2.raise_for_status()
+        res = r2.json()
+        status = res.get("status", "")
+        if status == "ready":
+            token = res["solution"]["token"]
+            print(f"[capsolver] [OK] Turnstile solved")
+            return token
+        if status not in ("processing", "idle"):
+            raise RuntimeError(f"[capsolver] Unexpected status: {status} | {res}")
+
+    raise TimeoutError("[capsolver] Turnstile solve timed out after 3 min")
+
+
+# ─── Auth ─────────────────────────────────────────────────────────────────────
+
+def _nextauth_login(base_url: str, email: str, password: str,
+                    is_registration: bool = False, full_name: str = "Alex Smith",
+                    turnstile_token: str | None = None,
+                    proxy: str | None = None) -> str:
+    """
+    Login (or register) via NextAuth credentials flow using Chrome TLS impersonation
+    (curl_cffi) to bypass Cloudflare bot detection.
+    Returns session JWT string, or raises RuntimeError on failure.
+    turnstile_token — required for registration (solve via CapSolver first).
+    """
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+
+    sess = cf_requests.Session()
+    sess.headers.update({
+        "User-Agent":      UA,
+        "Referer":         f"{base_url}/",
+        "Origin":          base_url,
+        "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+    if proxies:
+        sess.proxies = proxies
+
+    r = sess.get(f"{base_url}/api/auth/csrf", timeout=15, impersonate="chrome")
+    r.raise_for_status()
+    csrf = r.json()["csrfToken"]
+
+    form: dict = {
+        "csrfToken":   csrf,
+        "email":       email,
+        "password":    password,
+        "callbackUrl": f"{base_url}/start-now",
+        "json":        "true",
+        "redirect":    "false",
+    }
+    if is_registration:
+        form["isRegistration"] = "true"
+        form["fullName"]       = full_name
+    if turnstile_token:
+        form["cf-turnstile-response"] = turnstile_token
+
+    # Post directly to callback/credentials (NextAuth internals) — this is what
+    # the browser actually calls and where the Set-Cookie header is issued.
+    r2 = sess.post(
+        f"{base_url}/api/auth/callback/credentials",
+        data=form,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        allow_redirects=True,
+        timeout=30,
+        impersonate="chrome",
+    )
+
+    token = sess.cookies.get(SESSION_COOKIE)
+    if not token:
+        for c in sess.cookies:
+            if "session-token" in c.name:
+                token = c.value
+                break
+
+    if not token:
+        # Fallback: try signin/credentials endpoint
+        r3 = sess.post(
+            f"{base_url}/api/auth/signin/credentials",
+            data=form,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            allow_redirects=True,
+            timeout=30,
+            impersonate="chrome",
+        )
+        token = sess.cookies.get(SESSION_COOKIE)
+        if not token:
+            for c in sess.cookies:
+                if "session-token" in c.name:
+                    token = c.value
+                    break
+
+    if not token:
+        raise RuntimeError(f"Login failed for {email} at {base_url} — no session cookie returned.")
+    return token
+
+
+# ─── Account pool ─────────────────────────────────────────────────────────────
+
+POOL_FILE_DEFAULT = "accounts.json"
+
+def _pool_load(pool_file: str) -> list[dict]:
+    """Load account pool from JSON file. Returns [] if file doesn't exist."""
+    p = Path(pool_file)
+    if not p.exists():
+        return []
+    with open(p) as f:
+        data = json.load(f)
+    return data if isinstance(data, list) else []
+
+
+def _pool_save(pool_file: str, accounts: list[dict]) -> None:
+    """Save account pool to JSON file."""
+    with open(pool_file, "w") as f:
+        json.dump(accounts, f, indent=2)
+    print(f"[pool] Saved {len(accounts)} account(s) to {pool_file}")
+
+
+def _pool_get_token(pool_file: str, proxy: str | None = None) -> tuple[str, str] | None:
+    """
+    Try each account in the pool in order — login and return (email, token).
+    Marks failed accounts with 'failed': true so they are skipped next time.
+    Returns None if all accounts are exhausted.
+    """
+    accounts = _pool_load(pool_file)
+    changed  = False
+
+    for acc in accounts:
+        if acc.get("failed"):
+            continue
+        email    = acc.get("email", "")
+        password = acc.get("password", "")
+        if not email or not password:
+            continue
+
+        # Use cached session if fresh (< 12 hours old)
+        cached_token = acc.get("session_token")
+        cached_at    = acc.get("session_cached_at", 0)
+        if cached_token and (time.time() - cached_at) < 12 * 3600:
+            print(f"[pool] Using cached session for {email}")
+            return email, cached_token
+
+        print(f"[pool] Logging in as {email} ...")
+        try:
+            token = _nextauth_login(ARTLIST_BASE, email, password, proxy=proxy)
+            acc["session_token"]     = token
+            acc["session_cached_at"] = time.time()
+            changed = True
+            print(f"[pool] [OK] Logged in: {email}")
+            if changed:
+                _pool_save(pool_file, accounts)
+            return email, token
+        except Exception as e:
+            print(f"[pool] [FAIL] Login failed for {email}: {e}")
+            acc["failed"] = True
+            changed = True
+
+    if changed:
+        _pool_save(pool_file, accounts)
+    return None
+
+
+def pool_add_account(pool_file: str, email: str, password: str,
+                     session_token: str | None = None) -> None:
+    """Add or update an account in the pool file."""
+    accounts = _pool_load(pool_file)
+    for acc in accounts:
+        if acc.get("email") == email:
+            acc["password"] = password
+            if session_token:
+                acc["session_token"]     = session_token
+                acc["session_cached_at"] = time.time()
+            acc.pop("failed", None)
+            _pool_save(pool_file, accounts)
+            return
+    entry: dict = {"email": email, "password": password}
+    if session_token:
+        entry["session_token"]     = session_token
+        entry["session_cached_at"] = time.time()
+    accounts.append(entry)
+    _pool_save(pool_file, accounts)
+
+
+def get_session_token(args) -> str:
+    """
+    Resolve session JWT. Priority:
+      1. --session TOKEN
+      2. ARTLIST_SESSION env var
+      3. --accounts pool (auto-login, cached)
+      4. --email / --password direct login
+    """
+    token = getattr(args, "session", None) or os.environ.get("ARTLIST_SESSION")
+    if token:
+        print("[auth] Using provided session token.")
+        return token.strip()
+
+    proxy      = getattr(args, "proxy", None) or os.environ.get("ARTLIST_PROXY")
+    pool_file  = getattr(args, "accounts", None)
+
+    # Account pool
+    if pool_file:
+        result = _pool_get_token(pool_file, proxy=proxy)
+        if result:
+            _, token = result
+            return token
+        print("[pool] All accounts exhausted.")
+
+    # Direct email/password
+    email    = getattr(args, "email", None)    or os.environ.get("ARTLIST_EMAIL")
+    password = getattr(args, "password", None) or os.environ.get("ARTLIST_PASSWORD")
+
+    if not email or not password:
+        raise RuntimeError(
+            "No auth provided. Use --session, ARTLIST_SESSION env, "
+            "--accounts pool.json, or --email / --password."
+        )
+
+    print(f"[auth] Logging in as {email} ...")
+    try:
+        token = _nextauth_login(TOOLKIT_BASE, email, password, proxy=proxy)
+        print("[auth] [OK] Toolkit login succeeded.")
+        return token
+    except Exception:
+        pass
+
+    token = _nextauth_login(ARTLIST_BASE, email, password, proxy=proxy)
+    print("[auth] [OK] artlist.io login succeeded.")
+    return token
+
+
+# ─── tRPC client ─────────────────────────────────────────────────────────────
+
+class ToolkitClient:
+    """
+    Minimal non-batch tRPC client for toolkit.artlist.io.
+
+    Uses the browser-native non-batch format:
+      POST /api/trpc/<procedure>
+      Body: {"json": <data>, "meta": <meta>}    (no "0" wrapper)
+      Response: {"result": {"data": {"json": <result>}}}  (no array wrapper)
+
+    GET queries:
+      GET /api/trpc/<procedure>?input=<urlencoded>
+      Input param: {"json": <data>}             (no "0" wrapper)
+    """
+
+    def __init__(self, session_token: str, proxy: str | None = None):
+        self._sess = _make_session(proxy)
+        self._sess.cookies.set(SESSION_COOKIE, session_token,
+                               domain="toolkit.artlist.io")
+        self._sess.headers.update({
+            "Origin":         TOOLKIT_BASE,
+            "Referer":        f"{TOOLKIT_BASE}/",
+            "Content-Type":   "application/json",
+            "x-trpc-source":  "nextjs-react",   # required — identifies browser client
+        })
+
+    # ── Low-level calls ───────────────────────────────────────────────────────
+
+    def _post(self, procedure: str, data: dict, meta: dict | None = None) -> dict:
+        """tRPC mutation — POST /api/trpc/<procedure> (non-batch)"""
+        body: dict = {"json": data}
+        if meta:
+            body["meta"] = meta
+        # Add x-request-id (toolkit sends this per-request)
+        rid = _uuidv7()
+        url = f"{TOOLKIT_BASE}/api/trpc/{procedure}"
+        r = self._sess.post(url, json=body,
+                            headers={"x-request-id": rid}, timeout=45)
+        return self._parse(r, procedure)
+
+    def _get(self, procedure: str, data: dict) -> dict:
+        """tRPC query — GET /api/trpc/<procedure>?input=... (non-batch)"""
+        inp = json.dumps({"json": data})   # non-batch: no "0" wrapper
+        url = f"{TOOLKIT_BASE}/api/trpc/{procedure}"
+        r = self._sess.get(url, params={"input": inp}, timeout=45)
+        return self._parse(r, procedure)
+
+    @staticmethod
+    def _parse(r: requests.Response, label: str) -> dict:
+        r.raise_for_status()
+        body = r.json()
+        # Non-batch: {"result": ...}  Batch: [{"result": ...}]
+        item = body[0] if isinstance(body, list) else body
+        if item.get("error"):
+            msg = item["error"].get("json", {}).get("message", str(item["error"]))
+            raise RuntimeError(f"[{label}] {msg}")
+        d = item["result"]["data"]
+        return d.get("json", d)
+
+    # ── Upload ────────────────────────────────────────────────────────────────
+
+    def upload_image(self, image_path: str) -> tuple[str, str, str, str]:
+        """
+        Upload local image to S3 via presigned URL.
+        Returns (fileKey, bareS3Url, presignedGetUrl, mimeType).
+
+        bareS3Url    — used for getCostQuote input
+        presignedGetUrl — used for createUserGeneration inputs + artifacts
+        """
+        path = Path(image_path)
+        mime_map = {
+            ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+            ".png": "image/png",  ".webp": "image/webp",
+            ".gif": "image/gif",
+        }
+        mime_type = mime_map.get(path.suffix.lower(), "image/jpeg")
+
+        print(f"[upload] Requesting signed upload URL for {path.name} ...")
+        info = self._post("uploadRouter.getPresignedUrl", {
+            "fileName":  path.name,
+            "fileType":  mime_type,
+            "expiresIn": 86400,
+        })
+
+        presigned_put = info["presignedUrl"]
+        file_url      = info.get("fileUrl", presigned_put.split("?")[0])
+
+        # Extract the bare S3 URL (no query params) — used in getCostQuote
+        bare_s3_url = file_url.split("?")[0]
+
+        # Extract UUID key
+        file_key = info.get("fileKey") or (
+            bare_s3_url.split(".amazonaws.com/")[1]
+            if ".amazonaws.com/" in bare_s3_url else ""
+        )
+
+        print(f"[upload] Uploading {path.name} to S3 (key={file_key}) ...")
+        with open(image_path, "rb") as f:
+            r_put = requests.put(
+                presigned_put,
+                data=f,
+                headers={"Content-Type": mime_type},
+                timeout=120,
+            )
+        r_put.raise_for_status()
+
+        # Get a fresh presigned GET URL for the file
+        print(f"[upload] Fetching presigned GET URL ...")
+        pk = self._post("uploadRouter.getPresignedUrlFromKey", {
+            "fileKey":   file_key,
+            "expiresIn": 259200,
+        })
+        presigned_get = pk.get("presignedUrl", bare_s3_url)
+
+        print(f"[upload] [OK] Done. fileKey={file_key}")
+        return file_key, bare_s3_url, presigned_get, mime_type
+
+    # ── Cost quote ────────────────────────────────────────────────────────────
+
+    def get_cost_quote(self, presigned_get: str, prompt: str = "",
+                       aspect_ratio: str = "auto") -> dict:
+        """
+        modelRouter.getCostQuote (POST mutation)
+        MUST use the same presigned URL that will be sent in createUserGeneration —
+        the server embeds this URL in the costQuoteDigitalSignature JWT and
+        verifies it matches at generation time (mismatch → 404).
+        Returns inner data dict: {modelId, cost, costQuoteDigitalSignature, timestamp, ...}
+        """
+        print("[quote] Getting cost quote ...")
+        result = self._post("modelRouter.getCostQuote", {
+            "modelGroupId": MODEL_GROUP_ID,
+            "input": {
+                "prompt":       prompt,
+                "aspect_ratio": aspect_ratio,
+                "num_images":   1,
+                "image_urls":   [{"fileUrl": presigned_get}],
+            },
+        })
+
+        # Unwrap: result may be {"success": true, "data": {...}}
+        inner = result.get("data", result)
+        print(f"[quote] [OK] modelId={inner.get('modelId')}, cost={inner.get('cost')}")
+        return inner
+
+    # ── Chat Session ──────────────────────────────────────────────────────────
+
+    def create_chat_session(self, name: str = "My session") -> str:
+        """
+        chatSession.createChatSession  →  chatSessionId (server-assigned UUID)
+
+        MUST be called before createUserGeneration.
+        The server verifies the chatSessionId exists in the DB — using a
+        self-generated UUID causes NOT_FOUND (404) in createUserGeneration.
+        teamId is a client-generated UUID (browser uses crypto.randomUUID()).
+        """
+        team_id = _uuidv7()   # client-generated random UUID, like browser does
+        result = self._post("chatSession.createChatSession", {
+            "name":   name,
+            "teamId": team_id,
+        })
+        # Unwrap: {"data": {"id": "..."}}
+        session_id = result.get("data", {}).get("id") or result.get("id") or str(result)
+        print(f"[session] [OK] Created chatSession: {session_id}")
+        return session_id
+
+    # ── Generation ────────────────────────────────────────────────────────────
+
+    def create_generation(
+        self,
+        prompt:          str,
+        file_key:        str,
+        presigned_get:   str,
+        mime_type:       str,
+        quote:           dict,
+        chat_session_id: str,
+        aspect_ratio:    str = "auto",
+    ) -> str:
+        """
+        userGenerationRouter.createUserGeneration  →  chatSessionId (for polling)
+
+        chatSessionId MUST come from chatSession.createChatSession — the server
+        verifies it exists in the DB before processing the generation request.
+        """
+        # FIX: use the specific modelId returned by the quote, not the group ID
+        model_id = quote.get("modelId", 2152)
+        sig      = (quote.get("costQuoteDigitalSignature")
+                    or quote.get("digitalSignature", ""))
+        # FIX: only one "timestamp" key — use the quote's timestamp
+        ts       = quote.get("timestamp", int(time.time() * 1000))
+
+        payload = {
+            "chatSessionId": chat_session_id,
+            "inputs": {
+                "prompt":     prompt,
+                "image_urls": [{"fileUrl": presigned_get}],
+            },
+            "modelId":                   model_id,
+            "modelGroupId":              MODEL_GROUP_ID,
+            "feature":                   FEATURE,
+            "price":                     quote.get("cost", 0),
+            "timestamp":                 ts,
+            "settings": {
+                "prompt":       prompt,
+                "num_images":   1,
+                "aspect_ratio": aspect_ratio,
+            },
+            "artifacts": [{
+                "fileKey": file_key,
+                "metadata": {
+                    "fileUrl":         presigned_get,
+                    "mimeType":        mime_type,
+                    "inputSettingKey": "image_urls",
+                    "fileType":        "deviceUpload",
+                    "fileName":        "img 1",
+                },
+            }],
+            "costQuoteDigitalSignature": sig,
+            # These three are superjson-encoded undefined:
+            "thumbnailFileKey":  None,
+            "generationSource":  None,
+            "concurrencyAmount": None,
+            "generationMethod":  "free",
+            "isCopyCmsFileEnabled": False,
+        }
+
+        # superjson meta: server deserialises null → undefined for these fields
+        meta = {"values": {
+            "thumbnailFileKey":  ["undefined"],
+            "generationSource":  ["undefined"],
+            "concurrencyAmount": ["undefined"],
+        }}
+
+        print(f"[gen] Creating generation (sessionId={chat_session_id}) ...")
+        self._post("userGenerationRouter.createUserGeneration", payload, meta=meta)
+        print(f"[gen] [OK] Submitted. Waiting for result ...")
+        return chat_session_id
+
+    # ── Poll ──────────────────────────────────────────────────────────────────
+
+    def poll_generation(self, chat_session_id: str) -> list[str]:
+        """
+        userGenerationRouter.getUserGenerationsBySession (GET query, polls until done)
+        Returns list of output image URL strings.
+        """
+        start = time.time()
+
+        while True:
+            elapsed = time.time() - start
+            if elapsed > POLL_TIMEOUT:
+                raise TimeoutError(
+                    f"Generation timed out after {POLL_TIMEOUT}s. "
+                    "Check toolkit.artlist.io for status."
+                )
+
+            try:
+                data = self._get(
+                    "userGenerationRouter.getUserGenerationsBySession",
+                    {"sessionId": chat_session_id},
+                )
+            except Exception as e:
+                print(f"[poll] Fetch error (retrying): {e}")
+                time.sleep(POLL_INTERVAL)
+                continue
+
+            items: list = (
+                data if isinstance(data, list)
+                else data.get("items", [])
+            )
+
+            if not items:
+                print(f"[poll] No items yet ({elapsed:.0f}s) ...")
+                time.sleep(POLL_INTERVAL)
+                continue
+
+            item   = items[0] if isinstance(items, list) else items
+            status = (item.get("status") or "").lower()
+            print(f"[poll] status={status} ({elapsed:.0f}s)")
+
+            if status in ("completed", "done", "success", "finished"):
+                return self._extract_urls(item)
+
+            if status in ("failed", "error", "cancelled"):
+                err_code = item.get("errorCode") or ""
+                details  = json.dumps(item)[:400]
+                if not err_code and item.get("feature") == "image-to-image":
+                    # null errorCode after cost>0 = account out of free credits
+                    raise RuntimeError(
+                        "OUT_OF_CREDITS: Account has no free generations left. "
+                        "Use a fresh account or add credits at artlist.io."
+                    )
+                raise RuntimeError(f"Generation {status} [{err_code}]. Details: {details}")
+
+            time.sleep(POLL_INTERVAL)
+
+    @staticmethod
+    def _extract_urls(item: dict) -> list[str]:
+        """
+        Extract output image URLs from a completed generation item.
+
+        The HAR shows completed items have:
+          - thumbnailUrl: fast imgix CDN thumbnail
+          - fileKey / outputId: to call getUserGenerationOutputById for full URL
+        We return thumbnailUrl first (immediately available), then any fileUrl.
+        """
+        urls: list[str] = []
+
+        # 1. thumbnailUrl — imgix CDN, available immediately
+        thumb = item.get("thumbnailUrl")
+        if thumb and thumb.startswith("http"):
+            urls.append(thumb)
+
+        # 2. Any explicit fileUrl in the item
+        fu = item.get("fileUrl")
+        if fu and fu.startswith("http") and fu not in urls:
+            urls.append(fu)
+
+        # 3. Nested outputs / output arrays
+        for key in ("outputs", "output", "generatedImages"):
+            val = item.get(key)
+            if not val:
+                continue
+            if isinstance(val, str) and val.startswith("http"):
+                if val not in urls:
+                    urls.append(val)
+            elif isinstance(val, list):
+                for out in val:
+                    if isinstance(out, str) and out.startswith("http"):
+                        if out not in urls:
+                            urls.append(out)
+                    elif isinstance(out, dict):
+                        for field in ("url", "fileUrl", "outputUrl", "signedUrl", "thumbnailUrl"):
+                            u = out.get(field)
+                            if u and u.startswith("http") and u not in urls:
+                                urls.append(u)
+
+        return urls
+
+
+# ─── High-level pipeline ──────────────────────────────────────────────────────
+
+def _run_one(client: "ToolkitClient", image_path: str, prompt: str,
+             aspect_ratio: str, idx: int, total: int) -> list[str]:
+    """Run one image-to-image generation (upload → quote → session → gen → poll)."""
+    label = f"[{idx}/{total}]"
+    print(f"\n{label} ── Starting generation {idx} of {total} ──")
+
+    file_key, _, presigned_get, mime_type = client.upload_image(image_path)
+    quote           = client.get_cost_quote(presigned_get, prompt=prompt, aspect_ratio=aspect_ratio)
+    chat_session_id = client.create_chat_session()
+    chat_session_id = client.create_generation(
+        prompt=prompt,
+        file_key=file_key,
+        presigned_get=presigned_get,
+        mime_type=mime_type,
+        quote=quote,
+        chat_session_id=chat_session_id,
+        aspect_ratio=aspect_ratio,
+    )
+    return client.poll_generation(chat_session_id)
+
+
+def generate(args) -> list[str]:
+    """
+    Run image-to-image generation pipeline --count times.
+    Returns flat list of all output URLs from all runs.
+    """
+    proxy        = getattr(args, "proxy", None)  or os.environ.get("ARTLIST_PROXY")
+    prompt       = getattr(args, "prompt", "") or ""
+    count        = getattr(args, "count", 1) or 1
+    aspect_ratio = getattr(args, "aspect_ratio", "auto") or "auto"
+
+    token  = get_session_token(args)
+    client = ToolkitClient(token, proxy=proxy)
+
+    all_urls: list[str] = []
+    for i in range(1, count + 1):
+        urls = _run_one(client, args.image, prompt, aspect_ratio, i, count)
+        all_urls.extend(urls)
+
+    return all_urls
+
+
+def do_register(args) -> None:
+    """
+    Auto-register a new artlist.io account using CapSolver for Turnstile.
+    If --accounts is given, saves the new account to the pool file.
+    """
+    proxy         = getattr(args, "proxy", None)         or os.environ.get("ARTLIST_PROXY")
+    email         = getattr(args, "email", None)         or os.environ.get("ARTLIST_EMAIL")         or _random_email()
+    password      = getattr(args, "password", None)      or os.environ.get("ARTLIST_PASSWORD")      or _random_password()
+    name          = getattr(args, "name", "Alex Smith")  or "Alex Smith"
+    capsolver_key = getattr(args, "capsolver_key", None) or os.environ.get("CAPSOLVER_API_KEY")
+    site_key      = getattr(args, "turnstile_site_key", None) or os.environ.get("ARTLIST_TURNSTILE_KEY")
+    pool_file     = getattr(args, "accounts", None)
+
+    print(f"[register] New account: {email}")
+
+    # Solve Turnstile if CapSolver key + site key are available
+    turnstile_token: str | None = None
+    if capsolver_key and site_key:
+        turnstile_token = solve_turnstile(capsolver_key, site_key)
+    elif not capsolver_key:
+        print("[register] WARNING: --capsolver-key not provided — trying without Turnstile (may fail)")
+    elif not site_key:
+        print("[register] WARNING: --turnstile-site-key not provided — trying without Turnstile (may fail)")
+        print("           Find it: DevTools -> Network -> filter 'challenges.cloudflare.com'")
+        print("           Look for sitekey=0x4AAA... in the request URL")
+
+    try:
+        token = _nextauth_login(
+            ARTLIST_BASE, email, password,
+            is_registration=True, full_name=name,
+            turnstile_token=turnstile_token,
+            proxy=proxy,
+        )
+        print(f"\n[register] [OK] Account created!")
+        print(f"  Email:    {email}")
+        print(f"  Password: {password}")
+        print(f"  Token:    {token[:50]}...")
+
+        if pool_file:
+            pool_add_account(pool_file, email, password, session_token=token)
+            print(f"[register] [OK] Saved to pool: {pool_file}")
+
+    except Exception as e:
+        print(f"[register] [FAIL] Failed: {e}")
+        if not turnstile_token:
+            print()
+            print("TIP: Registration requires Turnstile captcha solving.")
+            print("     Get a CapSolver API key at https://capsolver.com")
+            print("     Then run:")
+            print(f"       python artlist_auto.py --register \\")
+            print(f"           --capsolver-key YOUR_KEY \\")
+            print(f"           --turnstile-site-key 0x4AAAxxxxxxxxxx")
+        sys.exit(1)
+
+
+# ─── CLI ──────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    p = argparse.ArgumentParser(
+        description="Artlist Toolkit — Auto Image-to-Image Generator",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Generate 2 images with existing session:
+  python artlist_auto.py --image photo.jpg --prompt "neon city" --session "eyJ..." --count 2
+
+  # Auto-register new account via CapSolver, then generate 2 images:
+  python artlist_auto.py --image photo.jpg --prompt "neon city" --count 2 \\
+      --capsolver-key "CAP-xxxx" --turnstile-site-key "0x4AAAxxxxxx"
+
+  # Use account pool (auto-login, rotate on failure):
+  python artlist_auto.py --image photo.jpg --prompt "neon city" --count 2 \\
+      --accounts accounts.json
+
+  # Register new account and save to pool:
+  python artlist_auto.py --register --accounts accounts.json \\
+      --capsolver-key "CAP-xxxx" --turnstile-site-key "0x4AAAxxxxxx"
+
+How to find the Turnstile site key:
+  1. Open https://artlist.io/start-now in Chrome
+  2. F12 → Network tab → filter "challenges.cloudflare.com"
+  3. Look for a request with sitekey=0x4AAA... in the URL
+  4. Copy that value and use as --turnstile-site-key
+""",
+    )
+
+    g_auth = p.add_argument_group("Auth")
+    g_auth.add_argument("--session", metavar="TOKEN",
+        help="Session JWT (__Secure-session.artlist-prod.session-token cookie)")
+    g_auth.add_argument("--email",    metavar="EMAIL", help="Account email  [env: ARTLIST_EMAIL]")
+    g_auth.add_argument("--password", metavar="PASS",  help="Account password  [env: ARTLIST_PASSWORD]")
+    g_auth.add_argument("--accounts", metavar="FILE",  default=None,
+        help="JSON file with account pool [{email,password},...] — auto-login & rotate")
+
+    g_cap = p.add_argument_group("CapSolver (auto-registration)")
+    g_cap.add_argument("--capsolver-key",     metavar="KEY",
+        help="CapSolver API key for Turnstile solving  [env: CAPSOLVER_API_KEY]")
+    g_cap.add_argument("--turnstile-site-key", metavar="SITEKEY",
+        help="Artlist Turnstile site key (0x4AAA...)  [env: ARTLIST_TURNSTILE_KEY]")
+
+    g_gen = p.add_argument_group("Generation")
+    g_gen.add_argument("--image",  metavar="PATH", help="Source image (.jpg / .png / .webp)")
+    g_gen.add_argument("--prompt", metavar="TEXT", default="",
+        help="Text prompt (default: empty)")
+    g_gen.add_argument("--count",  metavar="N", type=int, default=1,
+        help="Number of images to generate in one run (default: 1)")
+    g_gen.add_argument("--aspect-ratio", metavar="RATIO", default="auto",
+        choices=["auto", "1:1", "16:9", "9:16", "4:3", "3:4"],
+        help="Output aspect ratio (default: auto)")
+
+    g_net = p.add_argument_group("Network")
+    g_net.add_argument("--proxy", metavar="URL",
+        help="HTTP/SOCKS5 proxy URL  [env: ARTLIST_PROXY]")
+
+    p.add_argument("--register", action="store_true",
+        help="Register a new artlist.io account (uses CapSolver for Turnstile)")
+    p.add_argument("--name", metavar="NAME", default="Alex Smith",
+        help="Full name for registration (default: Alex Smith)")
+
+    args = p.parse_args()
+
+    if args.register:
+        do_register(args)
+        return
+
+    if not args.image:
+        p.print_help()
+        sys.exit(1)
+
+    if not Path(args.image).exists():
+        print(f"Error: image not found: {args.image}")
+        sys.exit(1)
+
+    try:
+        urls = generate(args)
+    except Exception as e:
+        print(f"\n[FAIL] Error: {e}")
+        sys.exit(1)
+
+    if not urls:
+        print("\nWARNING Generation completed but no output URLs found.")
+        print("Check toolkit.artlist.io to view your generated image.")
+        sys.exit(0)
+
+    count = getattr(args, "count", 1) or 1
+    print(f"\n{'='*60}")
+    print(f"[OK] Done! {len(urls)} image(s) generated from {count} run(s).")
+    print("Output URL(s):")
+    for url in urls:
+        print(f"  {url}")
+    print(f"{'='*60}")
+
+
+if __name__ == "__main__":
+    main()
